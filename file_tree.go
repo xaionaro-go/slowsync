@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -131,17 +132,24 @@ func (ft *fileTree) addNode(path string, node node) {
 }
 
 func (ft *fileTree) Scan() error {
+	log.Println("Scanning", ft.rootPath)
+	defer log.Println("Scanning", ft.rootPath, "-- complete")
+
 	if ft.cacheDB != nil {
 		ft.cacheDB.Exec(`START TRANSACTION`)
 		defer ft.cacheDB.Exec(`COMMIT`)
 	}
 
 	ft.nodes = map[string]node{}
-	return filepath.Walk(ft.rootPath, func(path string, info os.FileInfo, err error) error {
+	return filepath.Walk(ft.rootPath, func(filePath string, info os.FileInfo, err error) error {
+		if err != nil {
+			err = ft.addBrokenFile(filePath, err)
+			return nil
+		}
 		if info.IsDir() {
 			return nil
 		}
-		pathRel, err := filepath.Rel(ft.rootPath, path)
+		pathRel, err := filepath.Rel(ft.rootPath, filePath)
 		if err != nil {
 			return errors.New(err)
 		}
@@ -150,6 +158,9 @@ func (ft *fileTree) Scan() error {
 	})
 }
 func (src *fileTree) SyncTo(dstI FileTree) error {
+	log.Println("Syncing")
+	defer log.Println("Syncing -- complete")
+
 	filesToCopy := []string{}
 
 	dst := dstI.(*fileTree)
@@ -170,7 +181,14 @@ func (src *fileTree) SyncTo(dstI FileTree) error {
 
 	sort.Strings(filesToCopy)
 
+	count := 0
+	onePercentCount := len(filesToCopy) / 100
+
 	for _, filePath := range filesToCopy {
+		if count % onePercentCount == 0 {
+			fmt.Println(count / onePercentCount, "%")
+		}
+
 		dstDir := filepath.Dir(path.Join(dst.rootPath, filePath))
 		err := createDirectory(dstDir)
 		if err != nil {
