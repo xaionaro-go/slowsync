@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"syscall"
 
@@ -9,6 +10,7 @@ import (
 )
 
 func usage() {
+	fmt.Println("slowsync [options] <dir-from> <dir-to>")
 	os.Exit(int(syscall.EINVAL))
 }
 

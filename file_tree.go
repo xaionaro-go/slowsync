@@ -181,12 +181,11 @@ func (src *fileTree) SyncTo(dstI FileTree) error {
 
 	sort.Strings(filesToCopy)
 
-	count := 0
-	onePercentCount := len(filesToCopy) / 100
+	onePercentCount := (len(filesToCopy) + 99) / 100
 
-	for _, filePath := range filesToCopy {
-		if count % onePercentCount == 0 {
-			fmt.Println(count / onePercentCount, "%")
+	for idx, filePath := range filesToCopy {
+		if idx % onePercentCount == 0 {
+			fmt.Println(idx / onePercentCount, "%")
 		}
 
 		dstDir := filepath.Dir(path.Join(dst.rootPath, filePath))
@@ -256,21 +255,15 @@ func createDirectory(dir string) error {
 }
 
 func copyFileContents(src, dst string) (err error) {
-	defer func() {
-		if err != nil {
-			err = errors.New(err)
-		}
-	}()
-
 	in, err := os.Open(src)
 	if err != nil {
-		return
+		return errors.New(err)
 	}
 
 	defer in.Close()
 	out, err := os.Create(dst)
 	if err != nil {
-		return
+		return errors.New(err)
 	}
 
 	defer func() {
@@ -280,7 +273,7 @@ func copyFileContents(src, dst string) (err error) {
 		}
 	}()
 	if _, err = io.Copy(out, in); err != nil {
-		return
+		return errors.New(err)
 	}
 	return
 }
