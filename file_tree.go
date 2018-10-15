@@ -76,7 +76,9 @@ func GetCachedFileTree(dir, cachePath string) (FileTree, error) {
 	ft.cacheDB.SetMaxOpenConns(1)
 
 	if hasCache {
+		log.Println("Reading the cache from", ft.cachePath)
 		err = ft.ReadCache()
+		log.Println("Reading the cache from", ft.cachePath, "-- complete")
 	} else {
 		_, err = ft.cacheDB.Exec(`CREATE TABLE file_tree (path varchar(4096), size bigint)`)
 		if err != nil {
@@ -91,8 +93,6 @@ func GetCachedFileTree(dir, cachePath string) (FileTree, error) {
 	if err != nil {
 		return nil, errors.New(err)
 	}
-
-	fmt.Println(ft.nodes)
 
 	return ft, nil
 }
