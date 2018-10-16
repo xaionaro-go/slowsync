@@ -176,11 +176,16 @@ func (src *fileTree) SyncTo(dstI FileTree, dryRun bool) error {
 		if srcNode.size == dstNode.size {
 			continue
 		}
-		fmt.Println("to copy:", filePath, "; src size:", srcNode.size, "dst size:", dstNode.size)
 		filesToCopy = append(filesToCopy, filePath)
 	}
 
 	sort.Strings(filesToCopy)
+
+	fmt.Println("to copy")
+	for _, filePath := range filesToCopy {
+		fmt.Println(filePath)
+	}
+	fmt.Println("to copy -- complete")
 
 	onePercentCount := (len(filesToCopy) + 99) / 100
 
