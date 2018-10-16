@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sync"
 	"syscall"
 
 	"github.com/xaionaro-go/slowsync"
@@ -49,8 +50,21 @@ func main() {
 	srcDir := args[0]
 	dstDir := args[1]
 
-	srcFileTree := getFileTree(srcDir, *srcFileTreeCachePtr, *srcBrokenFilesPtr)
-	dstFileTree := getFileTree(dstDir, *dstFileTreeCachePtr, "")
+	var wg sync.WaitGroup
+	var srcFileTree, dstFileTree slowsync.FileTree
+
+	wg.Add(1)
+	go func() {
+		srcFileTree = getFileTree(srcDir, *srcFileTreeCachePtr, *srcBrokenFilesPtr)
+		wg.Done()
+	}()
+	wg.Add(1)
+	go func() {
+		dstFileTree = getFileTree(dstDir, *dstFileTreeCachePtr, "")
+		wg.Done()
+	}()
+
+	wg.Wait()
 
 	panicIfError(srcFileTree.SyncTo(dstFileTree, *dryRunPtr))
 }
