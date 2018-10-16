@@ -184,8 +184,8 @@ func (src *fileTree) SyncTo(dstI FileTree) error {
 	onePercentCount := (len(filesToCopy) + 99) / 100
 
 	for idx, filePath := range filesToCopy {
-		if idx % onePercentCount == 0 {
-			fmt.Println(idx / onePercentCount, "%")
+		if idx%onePercentCount == 0 {
+			fmt.Println(idx/onePercentCount, "%")
 		}
 
 		dstDir := filepath.Dir(path.Join(dst.rootPath, filePath))
@@ -221,7 +221,7 @@ func (ft *fileTree) SetBrokenFilesList(path string) error {
 		return errors.Wrap(err, ft.brokenFilesListPath)
 	}
 
-	ft.brokenFilesList, err = os.Open(ft.brokenFilesListPath)
+	ft.brokenFilesList, err = os.OpenFile(ft.brokenFilesListPath, os.O_APPEND|os.O_RDWR, os.ModeAppend)
 	if err != nil {
 		return errors.New(err, ft.brokenFilesListPath)
 	}
