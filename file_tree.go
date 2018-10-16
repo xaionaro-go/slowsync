@@ -252,7 +252,7 @@ func (src *fileTree) addBrokenFile(filePath string, fileErr error) error {
 	}
 	src.brokenFilesMap[filePath] = true
 	_, err := src.brokenFilesList.Write([]byte(fmt.Sprintf("%s\n", src)))
-	return errors.New(err)
+	return errors.Wrap(err)
 }
 
 func createDirectory(dir string) error {
