@@ -36,6 +36,7 @@ func getFileTree(dir, cachePath, brokenFilesList string) (fileTree slowsync.File
 }
 
 func main() {
+	dryRunPtr := flag.Bool("dry-run", false, "do not copy anything")
 	srcFileTreeCachePtr := flag.String("src-filetree-cache", "", "enables the file tree cache of the source and set the path where to store it")
 	srcBrokenFilesPtr := flag.String("src-broken-files", "", "enables the list of broken files and set the path to it")
 	dstFileTreeCachePtr := flag.String("dst-filetree-cache", "", "enables the file tree cache of the destination and set the path where to store it")
@@ -51,5 +52,5 @@ func main() {
 	srcFileTree := getFileTree(srcDir, *srcFileTreeCachePtr, *srcBrokenFilesPtr)
 	dstFileTree := getFileTree(dstDir, *dstFileTreeCachePtr, "")
 
-	panicIfError(srcFileTree.SyncTo(dstFileTree))
+	panicIfError(srcFileTree.SyncTo(dstFileTree, *dryRunPtr))
 }

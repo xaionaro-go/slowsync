@@ -33,7 +33,7 @@ type fileTree struct {
 }
 
 type FileTree interface {
-	SyncTo(FileTree) error
+	SyncTo(FileTree, bool) error
 	SetBrokenFilesList(path string) error
 }
 
@@ -157,7 +157,7 @@ func (ft *fileTree) Scan() error {
 		return nil
 	})
 }
-func (src *fileTree) SyncTo(dstI FileTree) error {
+func (src *fileTree) SyncTo(dstI FileTree, dryRun bool) error {
 	log.Println("Syncing")
 	defer log.Println("Syncing -- complete")
 
@@ -176,6 +176,7 @@ func (src *fileTree) SyncTo(dstI FileTree) error {
 		if srcNode.size == dstNode.size {
 			continue
 		}
+		fmt.Println("to copy:", filePath, "; src size:", srcNode.size, "dst size:", dstNode.size)
 		filesToCopy = append(filesToCopy, filePath)
 	}
 
@@ -184,8 +185,12 @@ func (src *fileTree) SyncTo(dstI FileTree) error {
 	onePercentCount := (len(filesToCopy) + 99) / 100
 
 	for idx, filePath := range filesToCopy {
-		if idx%onePercentCount == 0 {
+		/*if idx%onePercentCount == 0 {
 			fmt.Println(idx/onePercentCount, "%")
+		}*/
+		fmt.Println(idx/onePercentCount, "%: coping:", filePath)
+		if dryRun {
+			continue
 		}
 
 		dstDir := filepath.Dir(path.Join(dst.rootPath, filePath))
@@ -241,7 +246,7 @@ func (ft *fileTree) SetBrokenFilesList(path string) error {
 }
 
 func (src *fileTree) addBrokenFile(filePath string, fileErr error) error {
-	fmt.Println(filePath, fileErr)
+	fmt.Println("broken file:", filePath, fileErr)
 	if src.brokenFilesList == nil {
 		return nil
 	}
