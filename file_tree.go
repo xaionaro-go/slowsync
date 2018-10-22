@@ -181,11 +181,11 @@ func (src *fileTree) SyncTo(dstI FileTree, dryRun bool) error {
 
 	sort.Strings(filesToCopy)
 
-	fmt.Println("to copy")
+	/*fmt.Println("to copy")
 	for _, filePath := range filesToCopy {
 		fmt.Println(filePath)
 	}
-	fmt.Println("to copy -- complete")
+	fmt.Println("to copy -- complete")*/
 
 	onePercentCount := (len(filesToCopy) + 99) / 100
 
@@ -282,6 +282,38 @@ func copyFileContents(src, dst string) (err error) {
 			err = closeErr
 		}
 	}()
+
+	buf := make([]byte, 1024*1024)
+
+	writeResultChan := make(chan error)
+
+	for {
+		rn, err := io.ReadFull(in, buf)
+		wErr := <-writeResultChan
+		if wErr != nil {
+			return errors.Wrap(wErr)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return errors.Wrap(err)
+		}
+
+		go func(rn int) {
+			wn, err := out.Write(buf)
+			if wn != rn {
+				writeResultChan <- fmt.Errorf("written != read: %d != %d", wn, rn)
+				return
+			}
+			if err != nil {
+				writeResultChan <- err
+				return
+			}
+			writeResultChan <- nil
+		}(rn)
+	}
+
 	if _, err = io.Copy(out, in); err != nil {
 		return errors.New(err)
 	}
