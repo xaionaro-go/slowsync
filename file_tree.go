@@ -185,7 +185,7 @@ func (ft *fileTree) scanDir(rootPath string) error {
 	}
 	defer f.Close()
 	for {
-		list, err := f.Readdir(1)
+		names, err := f.Readdirnames(1)
 		if err != nil {
 			if err != io.EOF {
 				ft.addBrokenFile(rootPath, err)
@@ -193,21 +193,28 @@ func (ft *fileTree) scanDir(rootPath string) error {
 			break
 		}
 
-		for _, fileInfo := range list {
+		for _, fileName := range names {
+			filePath := filepath.Join(rootPath, fileName)
+			fileInfo, err := os.Lstat(filePath)
+			if err != nil {
+				ft.addBrokenFile(filePath, err)
+				continue
+			}
+
 			if fileInfo.IsDir() {
 				ft.scanWg.Add(1)
-				go func(fileInfo os.FileInfo) {
+				go func(filePath string, fileInfo os.FileInfo) {
 					defer ft.scanWg.Done()
-					filePath := filepath.Join(rootPath, fileInfo.Name())
+
 					err := ft.scanDir(filePath)
 					if err != nil {
 						ft.addBrokenFile(filePath, err)
 					}
-				}(fileInfo)
+				}(filePath, fileInfo)
 				continue
 			}
 
-			pathRel, err := filepath.Rel(ft.rootPath, filepath.Join(rootPath, fileInfo.Name()))
+			pathRel, err := filepath.Rel(ft.rootPath, filePath)
 			if err != nil {
 				return errors.New(err)
 			}
