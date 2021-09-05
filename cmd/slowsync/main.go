@@ -22,18 +22,35 @@ func panicIfError(err error) {
 	panic(err)
 }
 
-func getFileTree(dir, cachePath, brokenFilesList string) (fileTree slowsync.FileTree) {
+func getFileTree(dir, cachePath, brokenFilesList string, maxOpenFiles uint64) (fileTree slowsync.FileTree) {
 	var err error
 	if cachePath == "" {
-		fileTree, err = slowsync.GetFileTree(dir)
+		fileTree, err = slowsync.GetFileTree(dir, maxOpenFiles)
 	} else {
-		fileTree, err = slowsync.GetCachedFileTree(dir, cachePath)
+		fileTree, err = slowsync.GetCachedFileTree(dir, cachePath, maxOpenFiles)
 	}
 	panicIfError(err)
 	if brokenFilesList != "" {
 		panicIfError(fileTree.SetBrokenFilesList(brokenFilesList))
 	}
 	return
+}
+
+func setRLimits() syscall.Rlimit {
+	var rLimit syscall.Rlimit
+	rLimit.Max = 1024 * 1024
+	rLimit.Cur = 1024 * 1024
+	err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+	if err != nil {
+		fmt.Println("Error setting rlimit", err)
+	}
+
+	err = syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+	if err != nil {
+		fmt.Println("Error getting rlimit", err)
+		rLimit.Cur = 1024
+	}
+	return rLimit
 }
 
 func main() {
@@ -53,14 +70,16 @@ func main() {
 	var wg sync.WaitGroup
 	var srcFileTree, dstFileTree slowsync.FileTree
 
+	limits := setRLimits()
+
 	wg.Add(1)
 	go func() {
-		srcFileTree = getFileTree(srcDir, *srcFileTreeCachePtr, *srcBrokenFilesPtr)
+		srcFileTree = getFileTree(srcDir, *srcFileTreeCachePtr, *srcBrokenFilesPtr, limits.Cur/2-480)
 		wg.Done()
 	}()
 	wg.Add(1)
 	go func() {
-		dstFileTree = getFileTree(dstDir, *dstFileTreeCachePtr, "")
+		dstFileTree = getFileTree(dstDir, *dstFileTreeCachePtr, "", limits.Cur/2-480)
 		wg.Done()
 	}()
 

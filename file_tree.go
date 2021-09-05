@@ -2,6 +2,7 @@ package slowsync
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/xaionaro-go/errors"
+	"golang.org/x/sync/semaphore"
 )
 
 type node struct {
@@ -27,6 +29,7 @@ type fileTree struct {
 	nodeChan     chan node
 	nodeMap      map[string]node
 	nodeMapMutex sync.Mutex
+	semaphore    *semaphore.Weighted
 
 	scanWg sync.WaitGroup
 
@@ -44,7 +47,7 @@ type FileTree interface {
 	SetBrokenFilesList(path string) error
 }
 
-func GetFileTree(dir string) (FileTree, error) {
+func GetFileTree(dir string, maxOpenFiles uint64) (FileTree, error) {
 	var err error
 	dir, err = filepath.Abs(dir)
 	if err != nil {
@@ -55,6 +58,7 @@ func GetFileTree(dir string) (FileTree, error) {
 		nodeChan:       make(chan node, 1024),
 		nodeMap:        map[string]node{},
 		brokenFilesMap: map[string]bool{},
+		semaphore:      semaphore.NewWeighted(int64(maxOpenFiles)),
 	}
 	err = ft.scan()
 	if err != nil {
@@ -63,7 +67,7 @@ func GetFileTree(dir string) (FileTree, error) {
 	return ft, nil
 }
 
-func GetCachedFileTree(dir, cachePath string) (FileTree, error) {
+func GetCachedFileTree(dir, cachePath string, maxOpenFiles uint64) (FileTree, error) {
 	var err error
 	dir, err = filepath.Abs(dir)
 	if err != nil {
@@ -75,6 +79,7 @@ func GetCachedFileTree(dir, cachePath string) (FileTree, error) {
 		nodeChan:       make(chan node, 1024),
 		nodeMap:        map[string]node{},
 		brokenFilesMap: map[string]bool{},
+		semaphore:      semaphore.NewWeighted(int64(maxOpenFiles)),
 	}
 
 	hasCache := true
@@ -155,7 +160,10 @@ func (ft *fileTree) addNode(path string, node node) {
 
 func (ft *fileTree) scan() error {
 	log.Println("Scanning", ft.rootPath)
-	defer log.Println("Scanning", ft.rootPath, "-- complete")
+	go func() {
+		ft.scanWg.Wait()
+		log.Println("Scanning", ft.rootPath, "-- complete")
+	}()
 
 	return ft.scanDir(ft.rootPath)
 }
@@ -163,6 +171,9 @@ func (ft *fileTree) scan() error {
 func (ft *fileTree) scanDir(rootPath string) error {
 	ft.scanWg.Add(1)
 	defer ft.scanWg.Done()
+
+	ft.semaphore.Acquire(context.TODO(), 1)
+	defer ft.semaphore.Release(1)
 
 	if ft.cacheDB != nil {
 		ft.cacheDB.Exec(`START TRANSACTION`)
@@ -207,7 +218,7 @@ func (ft *fileTree) scanDir(rootPath string) error {
 	return nil
 }
 func (src *fileTree) SyncTo(dstI FileTree, dryRun bool) error {
-	log.Println("Syncing")
+	log.Println("Syncing: wait for SRC to complete scanning")
 	defer log.Println("Syncing -- complete")
 
 	var filesToCopy []string
@@ -215,6 +226,8 @@ func (src *fileTree) SyncTo(dstI FileTree, dryRun bool) error {
 	dst := dstI.(*fileTree)
 	for range dst.nodeChan {
 	}
+
+	log.Println("Syncing: filtering")
 
 	for srcNode := range src.nodeChan {
 		if src.brokenFilesMap != nil {
@@ -232,11 +245,13 @@ func (src *fileTree) SyncTo(dstI FileTree, dryRun bool) error {
 
 	sort.Strings(filesToCopy)
 
-	fmt.Println("to copy")
+	fmt.Println("Syncing: to copy report")
 	for _, filePath := range filesToCopy {
 		fmt.Println(filePath)
 	}
-	fmt.Println("to copy -- complete")
+	fmt.Println("Syncing: to copy report -- complete")
+
+	log.Println("Syncing: copying")
 
 	for _, filePath := range filesToCopy {
 		if dryRun {
@@ -244,6 +259,8 @@ func (src *fileTree) SyncTo(dstI FileTree, dryRun bool) error {
 		}
 
 		go func(filePath string) {
+			src.semaphore.Acquire(context.TODO(), 2)
+			defer src.semaphore.Release(2)
 			dstDir := filepath.Dir(path.Join(dst.rootPath, filePath))
 			err := createDirectory(dstDir)
 			if err != nil {
