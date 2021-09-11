@@ -225,7 +225,7 @@ func (ft *fileTree) scanDir(rootPath string) error {
 	return nil
 }
 func (src *fileTree) SyncTo(dstI FileTree, dryRun bool) error {
-	log.Println("Syncing: wait for SRC to complete scanning")
+	log.Println("Syncing: wait for DST to complete scanning")
 	defer log.Println("Syncing -- complete")
 
 	var filesToCopy []string
@@ -238,7 +238,10 @@ func (src *fileTree) SyncTo(dstI FileTree, dryRun bool) error {
 
 	for srcNode := range src.nodeChan {
 		if src.brokenFilesMap != nil {
-			if src.brokenFilesMap[srcNode.path] {
+			src.brokenFilesMapMutex.Lock()
+			isBrokenFile := src.brokenFilesMap[srcNode.path]
+			src.brokenFilesMapMutex.Unlock()
+			if isBrokenFile {
 				continue
 			}
 		}
