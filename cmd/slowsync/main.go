@@ -3,15 +3,19 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
+	"runtime/debug"
+	"strings"
 	"sync"
 	"syscall"
 
+	"github.com/andy2046/maths"
 	"github.com/xaionaro-go/slowsync"
 )
 
 func usage() {
-	fmt.Println("slowsync [options] <dir-from> <dir-to>")
+	fmt.Println("slowsync [options] <dir-from> <dir-to> [exclude-dir1 [exclude-dir2 [...]]]")
 	os.Exit(int(syscall.EINVAL))
 }
 
@@ -22,37 +26,6 @@ func panicIfError(err error) {
 	panic(err)
 }
 
-func getFileTree(dir, cachePath, brokenFilesList string, maxOpenFiles uint64) (fileTree slowsync.FileTree) {
-	var err error
-	if cachePath == "" {
-		fileTree, err = slowsync.GetFileTree(dir, maxOpenFiles)
-	} else {
-		fileTree, err = slowsync.GetCachedFileTree(dir, cachePath, maxOpenFiles)
-	}
-	panicIfError(err)
-	if brokenFilesList != "" {
-		panicIfError(fileTree.SetBrokenFilesList(brokenFilesList))
-	}
-	return
-}
-
-func setRLimits() syscall.Rlimit {
-	var rLimit syscall.Rlimit
-	rLimit.Max = 1024 * 1024
-	rLimit.Cur = 1024 * 1024
-	err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
-	if err != nil {
-		fmt.Println("Error setting rlimit", err)
-	}
-
-	err = syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
-	if err != nil {
-		fmt.Println("Error getting rlimit", err)
-		rLimit.Cur = 1024
-	}
-	return rLimit
-}
-
 func main() {
 	dryRunPtr := flag.Bool("dry-run", false, "do not copy anything")
 	srcFileTreeCachePtr := flag.String("src-filetree-cache", "", "enables the file tree cache of the source and set the path where to store it")
@@ -60,7 +33,7 @@ func main() {
 	dstFileTreeCachePtr := flag.String("dst-filetree-cache", "", "enables the file tree cache of the destination and set the path where to store it")
 	flag.Parse()
 	args := flag.Args()
-	if len(args) != 2 {
+	if len(args) < 2 {
 		usage()
 	}
 
@@ -70,20 +43,48 @@ func main() {
 	var wg sync.WaitGroup
 	var srcFileTree, dstFileTree slowsync.FileTree
 
-	limits := setRLimits()
+	limits := slowsync.SetRLimits(1024*1024, 1024*1024*10)
+	log.Printf("RLimits: %#+v", limits)
+	debug.SetMaxThreads(int(limits.Cur))
 
 	wg.Add(1)
 	go func() {
-		srcFileTree = getFileTree(srcDir, *srcFileTreeCachePtr, *srcBrokenFilesPtr, limits.Cur/2-480)
-		wg.Done()
+		defer wg.Done()
+		var err error
+		srcFileTree, err = slowsync.GetFileTreeWrapper(srcDir, *srcFileTreeCachePtr, *srcBrokenFilesPtr, 0, maths.Uint64Var.Min(limits.Cur/uint64(len(os.Args))-480, 15000))
+		panicIfError(err)
 	}()
+
 	wg.Add(1)
 	go func() {
-		dstFileTree = getFileTree(dstDir, *dstFileTreeCachePtr, "", limits.Cur/2-480)
-		wg.Done()
+		defer wg.Done()
+		var err error
+		dstFileTree, err = slowsync.GetFileTreeWrapper(dstDir, *dstFileTreeCachePtr, "", 0, maths.Uint64Var.Min(limits.Cur/uint64(len(os.Args))-480, 15000))
+		panicIfError(err)
 	}()
+
+	excludeFTChan := make(chan slowsync.FileTree, len(flag.Args()))
+	for _, arg := range flag.Args()[2:] {
+		wg.Add(1)
+		go func(arg string) {
+			defer wg.Done()
+			cachePath := ""
+			if *dstFileTreeCachePtr != "" {
+				cachePath = *dstFileTreeCachePtr + "-" + strings.ReplaceAll(arg, "/", "-")
+			}
+			fileTree, err := slowsync.GetFileTreeWrapper(arg, cachePath, "", 0, maths.Uint64Var.Min(limits.Cur/uint64(len(os.Args))-480, 15000))
+			panicIfError(err)
+			excludeFTChan <- fileTree
+		}(arg)
+	}
 
 	wg.Wait()
+	close(excludeFTChan)
 
-	panicIfError(srcFileTree.SyncTo(dstFileTree, *dryRunPtr))
+	var excludeFTs []slowsync.FileTree
+	for ch := range excludeFTChan {
+		excludeFTs = append(excludeFTs, ch)
+	}
+
+	panicIfError(srcFileTree.SyncTo(dstFileTree, excludeFTs, *dryRunPtr))
 }

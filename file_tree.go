@@ -3,8 +3,11 @@ package slowsync
 import (
 	"bufio"
 	"context"
+	"crypto/sha1"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"os"
@@ -12,6 +15,8 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"syscall"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/xaionaro-go/errors"
@@ -33,8 +38,10 @@ type fileTree struct {
 
 	scanWg sync.WaitGroup
 
-	cachePath string
-	cacheDB   *sql.DB
+	cachePath       string
+	cacheDB         *sql.DB
+	cacheDBTX       *sql.Tx
+	cacheDBTXLocker sync.Mutex
 
 	brokenFilesList     *os.File
 	brokenFilesListPath string
@@ -43,11 +50,13 @@ type fileTree struct {
 }
 
 type FileTree interface {
-	SyncTo(FileTree, bool) error
+	SyncTo(FileTree, []FileTree, bool) error
+	HashTree(func() hash.Hash) chan HashTreeItem
 	SetBrokenFilesList(path string) error
+	SplitList(hasher hash.Hash, levels uint, perm os.FileMode) error
 }
 
-func GetFileTree(dir string, maxOpenFiles uint64) (FileTree, error) {
+func GetFileTree(dir string, maxDepth uint, maxOpenFiles uint64) (FileTree, error) {
 	var err error
 	dir, err = filepath.Abs(dir)
 	if err != nil {
@@ -60,14 +69,94 @@ func GetFileTree(dir string, maxOpenFiles uint64) (FileTree, error) {
 		brokenFilesMap: map[string]bool{},
 		semaphore:      semaphore.NewWeighted(int64(maxOpenFiles)),
 	}
-	err = ft.scan()
+	err = ft.startScan(maxDepth)
 	if err != nil {
 		return nil, errors.New(err)
 	}
+	go func() {
+		ft.scanWg.Wait()
+		close(ft.nodeChan)
+	}()
 	return ft, nil
 }
 
-func GetCachedFileTree(dir, cachePath string, maxOpenFiles uint64) (FileTree, error) {
+type PrecalculatedDigester interface {
+	PrecalculatedDigest(filePath string) []byte
+}
+
+func (ft *fileTree) HashTree(
+	hasherFactory func() hash.Hash,
+) chan HashTreeItem {
+	result := make(chan HashTreeItem)
+	go func() {
+		var wg sync.WaitGroup
+		for i := 0; i < 1024; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				hasher := hasherFactory()
+				for srcNode := range ft.nodeChan {
+					path := filepath.Join(ft.rootPath, srcNode.path)
+					s, err := os.Stat(path)
+					if err != nil {
+						result <- HashTreeItem{
+							Path:  srcNode.path,
+							Error: fmt.Errorf("unable to stat(): %w", err),
+						}
+						return
+					}
+
+					if !s.Mode().IsRegular() {
+						continue
+					}
+
+					var digest []byte
+					if digestGetter, ok := hasher.(PrecalculatedDigester); ok {
+						digest = digestGetter.PrecalculatedDigest(srcNode.path)
+						if digest == nil {
+							log.Printf("no precalculated digest for '%s'", path)
+						}
+					}
+
+					if digest == nil {
+						f, err := os.Open(path)
+						if err != nil {
+							result <- HashTreeItem{
+								Path:  srcNode.path,
+								Error: fmt.Errorf("unable to open(): %w", err),
+							}
+							return
+						}
+						io.Copy(hasher, f)
+						f.Close()
+						digest = hasher.Sum(nil)
+					}
+
+					item := HashTreeItem{
+						Path:       srcNode.path,
+						Digest:     digest,
+						Size:       uint64(s.Size()),
+						ModifyTime: s.ModTime(),
+					}
+					if us, ok := s.Sys().(*syscall.Stat_t); ok {
+						item.ModifyTime = time.Unix(int64(us.Mtim.Sec), int64(us.Ctim.Nsec))
+						item.ChangeTime = time.Unix(int64(us.Ctim.Sec), int64(us.Mtim.Nsec))
+						item.AccessTime = time.Unix(int64(us.Atim.Sec), int64(us.Atim.Nsec))
+					}
+
+					result <- item
+				}
+			}()
+		}
+
+		wg.Wait()
+		close(result)
+	}()
+	return result
+}
+
+func GetCachedFileTree(dir, cachePath string, maxDepth uint, maxOpenFiles uint64) (FileTree, error) {
 	var err error
 	dir, err = filepath.Abs(dir)
 	if err != nil {
@@ -109,7 +198,7 @@ func GetCachedFileTree(dir, cachePath string, maxOpenFiles uint64) (FileTree, er
 		if err != nil {
 			return nil, errors.New(err)
 		}
-		err := ft.scan()
+		err := ft.startScan(maxDepth)
 		if err != nil {
 			return nil, errors.New(err)
 		}
@@ -148,37 +237,130 @@ func (ft *fileTree) readCache() error {
 	return nil
 }
 
-func (ft *fileTree) addNode(path string, node node) {
+func (ft *fileTree) SplitList(hasher hash.Hash, levels uint, perm os.FileMode) error {
+	if levels > uint(hasher.Size()) {
+		return fmt.Errorf("too many levels: %d > %d", levels, sha1.Size)
+	}
+	for srcNode := range ft.nodeChan {
+		srcPath := filepath.Join(ft.rootPath, srcNode.path)
+		s, err := os.Stat(srcPath)
+		if err != nil {
+			return fmt.Errorf("unable to stat(): %w", err)
+		}
+
+		if s.Mode().IsDir() {
+			continue
+		}
+
+		baseName := filepath.Base(srcPath)
+		if _, err = hasher.Write([]byte(baseName)); err != nil {
+			return fmt.Errorf("unable to hash '%s': %w", baseName, err)
+		}
+		var hashedName string
+		if stringer, ok := hasher.(fmt.Stringer); ok {
+			hashedName = stringer.String()
+		} else {
+			hashedName = hex.EncodeToString(hasher.Sum(nil))
+		}
+		hasher.Reset()
+		maxLevels := levels
+		if uint(len(hashedName)) < maxLevels {
+			maxLevels = uint(len(hashedName))
+		}
+		dirPath := ft.rootPath
+		for level := uint(0); level < maxLevels; level++ {
+			dirName := hashedName[level : level+1]
+			dirPath = filepath.Join(dirPath, dirName)
+		}
+
+		if err := os.MkdirAll(dirPath, perm); err != nil {
+			return fmt.Errorf("unable to make dir '%s': %w", dirPath, err)
+		}
+		dstPath := filepath.Join(dirPath, baseName)
+		if err := os.Rename(srcPath, dstPath); err != nil {
+			return fmt.Errorf("unable to rename '%s' to '%s': %w", srcPath, dstPath, err)
+		}
+	}
+	return nil
+}
+
+func (ft *fileTree) addNode(node node) {
 	ft.nodeMapMutex.Lock()
-	ft.nodeMap[path] = node
+	ft.nodeMap[node.path] = node
 	ft.nodeMapMutex.Unlock()
 	ft.nodeChan <- node
-	if ft.cacheDB != nil {
-		ft.cacheDB.Exec(`INSERT INTO file_tree (path, size) VALUES (?, ?)`, path, node.size)
+
+	ft.cacheDBTXLocker.Lock()
+	defer ft.cacheDBTXLocker.Unlock()
+	if ft.cacheDBTX != nil {
+		ft.cacheDBTX.Exec(`INSERT INTO file_tree (path, size) VALUES (?, ?)`, node.path, node.size)
 	}
 }
 
-func (ft *fileTree) scan() error {
+func (ft *fileTree) startScan(maxDepth uint) error {
 	log.Println("Scanning", ft.rootPath)
+
+	ctx, cancelFn := context.WithCancel(context.Background())
+	ft.scanWg.Add(1)
+	defer ft.scanWg.Done()
 	go func() {
 		ft.scanWg.Wait()
+		cancelFn()
 		log.Println("Scanning", ft.rootPath, "-- complete")
 	}()
 
-	return ft.scanDir(ft.rootPath)
+	if ft.cacheDB != nil {
+		ft.commitCacheDBTX() // to create the first transaction
+
+		go func() {
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+
+			// to commit the last transaction
+			defer func() {
+				ft.commitCacheDBTX()
+				ft.cacheDBTX = nil
+			}()
+
+			for {
+				select {
+				case <-ticker.C:
+					ft.commitCacheDBTX()
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	return ft.scanDir(ft.rootPath, maxDepth)
 }
 
-func (ft *fileTree) scanDir(rootPath string) error {
+func (ft *fileTree) commitCacheDBTX() {
+	log.Println("committing cache DB changes")
+	defer log.Println("committed cache DB changes")
+
+	ft.cacheDBTXLocker.Lock()
+	defer ft.cacheDBTXLocker.Unlock()
+
+	if ft.cacheDBTX != nil {
+		ft.cacheDBTX.Commit()
+	}
+
+	var err error
+	ft.cacheDBTX, err = ft.cacheDB.Begin()
+	if err != nil {
+		panic(err)
+	}
+}
+
+func (ft *fileTree) scanDir(rootPath string, maxDepth uint) error {
 	ft.scanWg.Add(1)
 	defer ft.scanWg.Done()
 
 	ft.semaphore.Acquire(context.TODO(), 1)
 	defer ft.semaphore.Release(1)
 
-	if ft.cacheDB != nil {
-		ft.cacheDB.Exec(`START TRANSACTION`)
-		defer ft.cacheDB.Exec(`COMMIT`)
-	}
 	f, err := os.Open(rootPath)
 	if err != nil {
 		return errors.New(err)
@@ -202,15 +384,21 @@ func (ft *fileTree) scanDir(rootPath string) error {
 			}
 
 			if fileInfo.IsDir() {
-				ft.scanWg.Add(1)
-				go func(filePath string, fileInfo os.FileInfo) {
-					defer ft.scanWg.Done()
+				if maxDepth != 1 {
+					ft.scanWg.Add(1)
+					go func(filePath string, fileInfo os.FileInfo) {
+						defer ft.scanWg.Done()
 
-					err := ft.scanDir(filePath)
-					if err != nil {
-						ft.addBrokenFile(filePath, err)
-					}
-				}(filePath, fileInfo)
+						nextDepth := maxDepth
+						if nextDepth != 0 {
+							nextDepth--
+						}
+						err := ft.scanDir(filePath, nextDepth)
+						if err != nil {
+							ft.addBrokenFile(filePath, err)
+						}
+					}(filePath, fileInfo)
+				}
 				continue
 			}
 
@@ -218,35 +406,77 @@ func (ft *fileTree) scanDir(rootPath string) error {
 			if err != nil {
 				return errors.New(err)
 			}
-			ft.addNode(pathRel, node{size: fileInfo.Size()})
+			ft.nodeMapMutex.Lock()
+			_, alreadySet := ft.nodeMap[pathRel]
+			ft.nodeMapMutex.Unlock()
+			if alreadySet {
+				ft.addBrokenFile(rootPath, fmt.Errorf("got into a cycle getdents in '%s'", rootPath))
+				return nil
+			}
+			ft.addNode(node{path: pathRel, size: fileInfo.Size()})
 		}
 	}
 
 	return nil
 }
-func (src *fileTree) SyncTo(dstI FileTree, dryRun bool) error {
-	log.Println("Syncing: wait for DST to complete scanning")
+
+func (ft *fileTree) SyncTo(
+	dstI FileTree,
+	excludeFTs []FileTree,
+	dryRun bool,
+) error {
+	return ft.syncTo(dstI.(*fileTree).rootPath, dstI, excludeFTs, dryRun)
+}
+
+func (ft *fileTree) syncTo(
+	dstRootDir string,
+	cmpI FileTree,
+	excludeFTIs []FileTree,
+	dryRun bool,
+) error {
+	log.Println("Syncing: wait for DST and EXC to complete scanning")
 	defer log.Println("Syncing -- complete")
+
+	var excludeFTs []*fileTree
+	for _, ft := range excludeFTIs {
+		excludeFTs = append(excludeFTs, ft.(*fileTree))
+	}
 
 	var filesToCopy []string
 
-	dst := dstI.(*fileTree)
-	for range dst.nodeChan {
+	cmp := cmpI.(*fileTree)
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range cmp.nodeChan {
+		}
+	}()
+
+	for _, ft := range excludeFTs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range ft.nodeChan {
+			}
+		}()
 	}
 
 	log.Println("Syncing: filtering")
 
-	for srcNode := range src.nodeChan {
-		if src.brokenFilesMap != nil {
-			src.brokenFilesMapMutex.Lock()
-			isBrokenFile := src.brokenFilesMap[srcNode.path]
-			src.brokenFilesMapMutex.Unlock()
+	for srcNode := range ft.nodeChan {
+		if ft.brokenFilesMap != nil {
+			ft.brokenFilesMapMutex.Lock()
+			isBrokenFile := ft.brokenFilesMap[srcNode.path]
+			ft.brokenFilesMapMutex.Unlock()
 			if isBrokenFile {
 				continue
 			}
 		}
 
-		dstNode := dst.nodeMap[srcNode.path]
+		dstNode := cmp.nodeMap[srcNode.path]
 		if srcNode.size == dstNode.size {
 			continue
 		}
@@ -268,19 +498,31 @@ func (src *fileTree) SyncTo(dstI FileTree, dryRun bool) error {
 			continue
 		}
 
+		shouldExclude := false
+		for _, excFT := range excludeFTs {
+			_, ok := excFT.nodeMap[filePath]
+			if ok {
+				shouldExclude = true
+				break
+			}
+		}
+		if shouldExclude {
+			continue
+		}
+
 		go func(filePath string) {
-			src.semaphore.Acquire(context.TODO(), 2)
-			defer src.semaphore.Release(2)
-			dstDir := filepath.Dir(path.Join(dst.rootPath, filePath))
+			ft.semaphore.Acquire(context.TODO(), 2)
+			defer ft.semaphore.Release(2)
+			dstDir := filepath.Dir(path.Join(dstRootDir, filePath))
 			err := createDirectory(dstDir)
 			if err != nil {
 				fmt.Println("cannot create directory", dstDir)
 				return
 			}
-			err = copyFileContents(path.Join(src.rootPath, filePath), path.Join(dst.rootPath, filePath))
+			err = copyFileContents(path.Join(ft.rootPath, filePath), path.Join(dstRootDir, filePath))
 			if err != nil {
 				// TODO: consider possible errors on the destination side
-				err = src.addBrokenFile(filePath, err)
+				err = ft.addBrokenFile(filePath, err)
 				if err != nil {
 					panic(err)
 				}
@@ -311,9 +553,11 @@ func (ft *fileTree) SetBrokenFilesList(path string) error {
 	}
 
 	scanner := bufio.NewScanner(ft.brokenFilesList)
+	ft.brokenFilesMapMutex.Lock()
 	for scanner.Scan() {
 		ft.brokenFilesMap[scanner.Text()] = true
 	}
+	defer ft.brokenFilesMapMutex.Unlock()
 
 	if err := scanner.Err(); err != nil {
 		return errors.New(err)
@@ -322,15 +566,15 @@ func (ft *fileTree) SetBrokenFilesList(path string) error {
 	return nil
 }
 
-func (src *fileTree) addBrokenFile(filePath string, fileErr error) error {
+func (ft *fileTree) addBrokenFile(filePath string, fileErr error) error {
 	fmt.Println("broken file:", filePath, fileErr)
-	if src.brokenFilesList == nil {
+	if ft.brokenFilesList == nil {
 		return nil
 	}
-	src.brokenFilesMapMutex.Lock()
-	defer src.brokenFilesMapMutex.Unlock()
-	src.brokenFilesMap[filePath] = true
-	_, err := src.brokenFilesList.Write([]byte(fmt.Sprintf("%s\n", filePath)))
+	ft.brokenFilesMapMutex.Lock()
+	defer ft.brokenFilesMapMutex.Unlock()
+	ft.brokenFilesMap[filePath] = true
+	_, err := ft.brokenFilesList.Write([]byte(fmt.Sprintf("%s\n", filePath)))
 	return errors.Wrap(err)
 }
 
@@ -338,8 +582,8 @@ func createDirectory(dir string) error {
 	return os.MkdirAll(dir, os.ModePerm)
 }
 
-func copyFileContents(src, dst string) (err error) {
-	in, err := os.Open(src)
+func copyFileContents(ft, dst string) (err error) {
+	in, err := os.Open(ft)
 	if err != nil {
 		return errors.New(err)
 	}
