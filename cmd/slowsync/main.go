@@ -45,7 +45,7 @@ func main() {
 
 	limits := slowsync.SetRLimits(1024*1024, 1024*1024*10)
 	log.Printf("RLimits: %#+v", limits)
-	debug.SetMaxThreads(int(limits.Cur))
+	debug.SetMaxThreads(int(limits.Cur) * 10)
 
 	wg.Add(1)
 	go func() {
@@ -59,7 +59,7 @@ func main() {
 	go func() {
 		defer wg.Done()
 		var err error
-		dstFileTree, err = slowsync.GetFileTreeWrapper(dstDir, *dstFileTreeCachePtr, "", 0, maths.Uint64Var.Min(limits.Cur/uint64(len(os.Args))-480, 15000))
+		dstFileTree, err = slowsync.GetFileTreeWrapper(dstDir, *dstFileTreeCachePtr, "", 0, maths.Uint64Var.Min(limits.Cur/uint64(len(os.Args))-480, 5000))
 		panicIfError(err)
 	}()
 
@@ -87,4 +87,5 @@ func main() {
 	}
 
 	panicIfError(srcFileTree.SyncTo(dstFileTree, excludeFTs, *dryRunPtr))
+	log.Println("end")
 }

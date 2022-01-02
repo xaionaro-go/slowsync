@@ -1,7 +1,7 @@
 package slowsync
 
 import (
-	"fmt"
+	"log"
 	"syscall"
 
 	"github.com/andy2046/maths"
@@ -11,14 +11,14 @@ func setRLimit(rLimitID int, rlimitValue uint64) syscall.Rlimit {
 	var rLimit syscall.Rlimit
 	rLimit.Max = rlimitValue
 	rLimit.Cur = rlimitValue
-	err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+	err := syscall.Setrlimit(rLimitID, &rLimit)
 	if err != nil {
-		fmt.Println("Error setting rlimit", err)
+		log.Println("Error setting rlimit", err)
 	}
 
-	err = syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+	err = syscall.Getrlimit(rLimitID, &rLimit)
 	if err != nil {
-		fmt.Println("Error getting rlimit", err)
+		log.Println("Error getting rlimit", err)
 		rLimit.Cur = 1024
 	}
 	return rLimit

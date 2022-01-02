@@ -7,6 +7,9 @@ import (
 	"flag"
 	"fmt"
 	"hash"
+	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"strings"
 	"syscall"
@@ -28,13 +31,21 @@ func panicIfError(err error) {
 
 func main() {
 	perms := os.FileMode(0644)
-	levelsPtr := flag.Uint("dir-levels", 3, "how many levels to do")
+	levelsPtr := flag.Uint("dir-levels", 6, "how many levels to do")
+	skipFirstCharsPtr := flag.Uint("skip-first-chars", 0, "how many characters of the hash to skip (from the beginning)")
 	flag.Var((*fileModeVar)(&perms), "dir-perms", "permissions to create directories with")
 	hashFuncNamePtr := flag.String("hash", "sha1", "which hash function to use: none, md5, sha1, sha512")
+	netPprofPtr := flag.String("net-pprof", ":18095", "")
 	flag.Parse()
 	args := flag.Args()
 	if len(args) != 1 {
 		usage()
+	}
+
+	if *netPprofPtr != "" {
+		go func() {
+			log.Println(http.ListenAndServe(*netPprofPtr, nil))
+		}()
 	}
 
 	dir := args[0]
@@ -54,6 +65,6 @@ func main() {
 	fileTree, err := slowsync.GetFileTreeWrapper(dir, "", "", 1, 1)
 	panicIfError(err)
 
-	err = fileTree.SplitList(hasher, levels, perms)
+	err = fileTree.SplitList(hasher, levels, perms, *skipFirstCharsPtr)
 	panicIfError(err)
 }

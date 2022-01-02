@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/andy2046/maths"
+	"github.com/hashicorp/go-multierror"
 	"github.com/xaionaro-go/slowsync"
 )
 
@@ -35,30 +36,55 @@ var _ slowsync.PrecalculatedDigester = (*precalculatedHasher)(nil)
 
 type precalculatedHasher struct {
 	hash.Hash
-	digestsMap map[string][]byte
+	digestsMapDBLocker *sync.Mutex
+	digestsMapDB       *sql.DB
 }
 
 func (h *precalculatedHasher) PrecalculatedDigest(filePath string) []byte {
-	return h.digestsMap[path.Clean(filePath)]
+	h.digestsMapDBLocker.Lock()
+	defer h.digestsMapDBLocker.Unlock()
+	rows, err := h.digestsMapDB.Query("SELECT digest FROM hashes WHERE path = ?", filePath)
+	if err != nil && err != sql.ErrNoRows {
+		panic(err)
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return nil
+	}
+
+	if err := rows.Err(); err != nil && err != sql.ErrNoRows {
+		panic(err)
+	}
+
+	var digest []byte
+	if err := rows.Scan(&digest); err != nil {
+		panic(err)
+	}
+
+	return digest
 }
 
-func newHasherFactory(digestsMap map[string][]byte) func() hash.Hash {
-	if digestsMap == nil {
+func newHasherFactory(digestsMapDB *sql.DB) func() hash.Hash {
+	if digestsMapDB == nil {
 		return func() hash.Hash {
 			return sha256.New()
 		}
 	}
 
+	locker := &sync.Mutex{}
 	return func() hash.Hash {
 		return &precalculatedHasher{
-			Hash:       sha256.New(),
-			digestsMap: digestsMap,
+			Hash:               sha256.New(),
+			digestsMapDB:       digestsMapDB,
+			digestsMapDBLocker: locker,
 		}
 	}
 }
 
 func main() {
 	precalculatedDigestsFilePtr := flag.String("precalculated-digests-file", "", "to avoid rehashing file content by reusing results of 'find <dir> -type f -exec sha256sum {} +'")
+	precalculatedDigestsParsedFilePtr := flag.String("precalculated-digests-parsed-dir", "", "reuse parsed 'find <dir> -type f -exec sha256sum {} +' sqlite database")
 	sqlite3PathPtr := flag.String("sqlite3db", "", "enables storing the hash tree into an sqlite3 DB")
 	flag.Parse()
 	args := flag.Args()
@@ -68,12 +94,29 @@ func main() {
 
 	dir := args[0]
 	precalculatedDigestsFile := *precalculatedDigestsFilePtr
+	precalculatedDigestsParsedFile := *precalculatedDigestsParsedFilePtr
 
-	var digestsMap map[string][]byte
+	if precalculatedDigestsFile != "" && precalculatedDigestsParsedFile != "" {
+		panic("cannot set both '-precalculated-digests-file' and '-precalculated-digests-parsed-dir'")
+	}
+
+	var digestsMapDB *sql.DB
 	if precalculatedDigestsFile != "" {
 		var err error
-		digestsMap, err = parseDigetsFile(precalculatedDigestsFile)
-		if len(digestsMap) == 0 && err != nil {
+		digestsMapDB, err = parseDigestsFile(precalculatedDigestsFile)
+		if digestsMapDB == nil && err != nil {
+			panic(err)
+		}
+		if err != nil {
+			for _, err := range err.(*multierror.Error).Errors {
+				log.Printf("precalculated digests file error: %v", err)
+			}
+		}
+	}
+	if precalculatedDigestsParsedFile != "" {
+		var err error
+		digestsMapDB, err = openParsedDigestsFile(precalculatedDigestsParsedFile)
+		if err != nil {
 			panic(err)
 		}
 	}
@@ -125,12 +168,12 @@ func main() {
 
 	limits := slowsync.SetRLimits(1024*1024, 1024*1024*10)
 	log.Printf("RLimits: %#+v", limits)
-	debug.SetMaxThreads(int(limits.Cur))
+	debug.SetMaxThreads(int(limits.Cur) * 10)
 
-	fileTree, err := slowsync.GetFileTreeWrapper(dir, "", "", 0, maths.Uint64Var.Min(limits.Cur/uint64(len(os.Args))-480, 15000))
+	fileTree, err := slowsync.GetFileTreeWrapper(dir, "", "", 0, maths.Uint64Var.Min(limits.Cur/uint64(len(os.Args))-480, 5000))
 	panicIfError(err)
 
-	for item := range fileTree.HashTree(newHasherFactory(digestsMap)) {
+	for item := range fileTree.HashTree(newHasherFactory(digestsMapDB)) {
 		filePath := path.Clean(item.Path)
 		fmt.Printf("%s\n", item.String())
 		if item.Error == nil && dbEnabled {
@@ -145,4 +188,6 @@ func main() {
 	if dbEnabled {
 		dbCommitBegin()
 	}
+
+	log.Println("end")
 }
