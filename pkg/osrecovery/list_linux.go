@@ -5,7 +5,6 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -61,7 +60,7 @@ func initOpenHandler() {
 	defer func() {
 		log.Println("listHandlerPath:", listHandlerCompiledPath)
 	}()
-	oldSource, err := ioutil.ReadFile(listHandlerSourcePath)
+	oldSource, err := os.ReadFile(listHandlerSourcePath)
 	if err == nil && bytes.Equal(oldSource, []byte(listHandlerSource)) {
 		fInfo, err := os.Stat(listHandlerCompiledPath)
 		if err == nil && fInfo.Size() > 0 && fInfo.Mode().IsRegular() {
@@ -81,7 +80,7 @@ func initOpenHandler() {
 	if err != nil {
 		panic(err)
 	}
-	err = ioutil.WriteFile(listHandlerSourcePath, []byte(listHandlerSource), 0640)
+	err = os.WriteFile(listHandlerSourcePath, []byte(listHandlerSource), 0640)
 	if err != nil {
 		panic(err)
 	}

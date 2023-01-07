@@ -26,7 +26,7 @@ type listOutputParser struct {
 	logger              logger.Logger
 	cancelFn            context.CancelFunc
 	status              int
-	wgReader            sync.WaitGroup
+	wgWriteLock         sync.Mutex
 	wgWatchDog          sync.WaitGroup
 }
 
@@ -78,7 +78,8 @@ func (p *listOutputParser) watchDog(ctx context.Context) {
 
 func (p *listOutputParser) Close() {
 	p.wgWatchDog.Wait()
-	p.wgReader.Wait()
+	p.wgWriteLock.Lock()
+	defer p.wgWriteLock.Unlock()
 	close(p.NameCh)
 	close(p.ErrCh)
 }
@@ -93,8 +94,8 @@ func (p *listOutputParser) LastNewNameTS() time.Time {
 var fieldSeparator = []byte{0}
 
 func (p *listOutputParser) Write(b []byte) (int, error) {
-	p.wgReader.Add(1)
-	defer p.wgReader.Done()
+	p.wgWriteLock.Lock()
+	defer p.wgWriteLock.Unlock()
 
 	n := 0
 	parseFieldSeparatorType := func() {
@@ -107,10 +108,14 @@ func (p *listOutputParser) Write(b []byte) (int, error) {
 			p.nameCount[name] = count
 			switch {
 			case count == 1:
-				p.lastNewNameTSLocker.Lock()
-				p.lastNewNameTS = time.Now()
-				p.lastNewNameTSLocker.Unlock()
-				p.NameCh <- name
+				func() {
+					p.lastNewNameTSLocker.Lock()
+					defer func() {
+						p.lastNewNameTS = time.Now()
+						p.lastNewNameTSLocker.Unlock()
+					}()
+					p.NameCh <- name
+				}()
 			case count > 10:
 				p.ErrCh <- fmt.Errorf("name '%s' is duplicated (count: %d), cancelling the dir-scanning", name, count)
 				p.cancelFn()
