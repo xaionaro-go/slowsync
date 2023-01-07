@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"hash"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path"
 	"runtime/debug"
@@ -86,10 +88,17 @@ func main() {
 	precalculatedDigestsFilePtr := flag.String("precalculated-digests-file", "", "to avoid rehashing file content by reusing results of 'find <dir> -type f -exec sha256sum {} +'")
 	precalculatedDigestsParsedFilePtr := flag.String("precalculated-digests-parsed-dir", "", "reuse parsed 'find <dir> -type f -exec sha256sum {} +' sqlite database")
 	sqlite3PathPtr := flag.String("sqlite3db", "", "enables storing the hash tree into an sqlite3 DB")
+	netPProfPtr := flag.String("net-pprof", "", "")
 	flag.Parse()
 	args := flag.Args()
 	if len(args) != 1 {
 		usage()
+	}
+
+	if *netPProfPtr != "" {
+		go func() {
+			log.Println(http.ListenAndServe(*netPProfPtr, nil))
+		}()
 	}
 
 	dir := args[0]

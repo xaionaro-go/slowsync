@@ -90,11 +90,11 @@ func (ft *fileTree) HashTree(
 				hasher := hasherFactory()
 				for srcNode := range ft.nodeChan {
 					path := filepath.Join(ft.rootPath, srcNode.path)
-					s, err := os.Stat(path)
+					s, err := os.Lstat(path)
 					if err != nil {
 						result <- HashTreeItem{
 							Path:  srcNode.path,
-							Error: fmt.Errorf("unable to stat(): %w", err),
+							Error: fmt.Errorf("unable to lstat(): %w", err),
 						}
 						continue
 					}
@@ -232,9 +232,9 @@ func (ft *fileTree) SplitList(hasher hash.Hash, levels uint, perm os.FileMode, s
 	}
 	for srcNode := range ft.nodeChan {
 		srcPath := filepath.Join(ft.rootPath, srcNode.path)
-		s, err := os.Stat(srcPath)
+		s, err := os.Lstat(srcPath)
 		if err != nil {
-			return fmt.Errorf("unable to stat(): %w", err)
+			return fmt.Errorf("unable to lstat(): %w", err)
 		}
 
 		if s.Mode().IsDir() {
@@ -287,7 +287,7 @@ func (ft *fileTree) addNode(node node) {
 }
 
 func (ft *fileTree) backgroundScan(maxDepth uint) {
-	log.Println("Scanning", ft.rootPath)
+	log.Println("Scanning root", ft.rootPath)
 
 	ctx, cancelFn := context.WithCancel(context.Background())
 	if ft.cacheDB != nil {
@@ -314,14 +314,7 @@ func (ft *fileTree) backgroundScan(maxDepth uint) {
 		}()
 	}
 
-	ft.scanWg.Add(1)
-	go func() {
-		defer ft.scanWg.Done()
-		err := ft.scanDir(ft.rootPath, maxDepth)
-		if err != nil {
-			ft.addBrokenFile(ft.rootPath, err)
-		}
-	}()
+	ft.scanDirBackground(ft.rootPath, maxDepth)
 
 	go func() {
 		ft.scanWg.Wait()
@@ -329,6 +322,11 @@ func (ft *fileTree) backgroundScan(maxDepth uint) {
 		close(ft.nodeChan)
 		log.Println("Scanning", ft.rootPath, "-- complete")
 	}()
+}
+
+func (ft *fileTree) scanDirBackground(rootPath string, maxDepth uint) {
+	s := newDirScanner(ft, rootPath, maxDepth)
+	s.Start()
 }
 
 func (ft *fileTree) commitCacheDBTX() {
@@ -347,69 +345,6 @@ func (ft *fileTree) commitCacheDBTX() {
 	if err != nil {
 		panic(err)
 	}
-}
-
-func (ft *fileTree) scanDir(rootPath string, maxDepth uint) error {
-	ft.semaphore.Acquire(context.TODO(), 1)
-	defer ft.semaphore.Release(1)
-
-	f, err := os.Open(rootPath)
-	if err != nil {
-		return errors.New(err)
-	}
-	defer f.Close()
-	for {
-		names, err := f.Readdirnames(1)
-		if err != nil {
-			if err != io.EOF {
-				ft.addBrokenFile(rootPath, err)
-			}
-			break
-		}
-
-		for _, fileName := range names {
-			filePath := filepath.Join(rootPath, fileName)
-			fileInfo, err := os.Lstat(filePath)
-			if err != nil {
-				ft.addBrokenFile(filePath, err)
-				continue
-			}
-
-			if fileInfo.IsDir() {
-				if maxDepth != 1 {
-					ft.scanWg.Add(1)
-					go func(filePath string, fileInfo os.FileInfo) {
-						defer ft.scanWg.Done()
-
-						nextDepth := maxDepth
-						if nextDepth != 0 {
-							nextDepth--
-						}
-						err := ft.scanDir(filePath, nextDepth)
-						if err != nil {
-							ft.addBrokenFile(filePath, err)
-						}
-					}(filePath, fileInfo)
-				}
-				continue
-			}
-
-			pathRel, err := filepath.Rel(ft.rootPath, filePath)
-			if err != nil {
-				return errors.New(err)
-			}
-			ft.nodeMapMutex.Lock()
-			_, alreadySet := ft.nodeMap[pathRel]
-			ft.nodeMapMutex.Unlock()
-			if alreadySet {
-				ft.addBrokenFile(rootPath, fmt.Errorf("got into a cycle getdents in '%s'", rootPath))
-				return nil
-			}
-			ft.addNode(node{path: pathRel, size: fileInfo.Size()})
-		}
-	}
-
-	return nil
 }
 
 func (ft *fileTree) SyncTo(
@@ -516,7 +451,7 @@ func (ft *fileTree) syncTo(
 			err = copyFileContents(path.Join(ft.rootPath, filePath), path.Join(dstRootDir, filePath))
 			if err != nil {
 				// TODO: consider possible errors on the destination side
-				err = ft.addBrokenFile(filePath, err)
+				_, err = ft.addBrokenFile(filePath, err)
 				if err != nil {
 					panic(err)
 				}
@@ -560,16 +495,19 @@ func (ft *fileTree) SetBrokenFilesList(path string) error {
 	return nil
 }
 
-func (ft *fileTree) addBrokenFile(filePath string, fileErr error) error {
-	fmt.Println("broken file:", filePath, fileErr)
-	if ft.brokenFilesList == nil {
-		return nil
-	}
+func (ft *fileTree) addBrokenFile(filePath string, fileErr error) (bool, error) {
 	ft.brokenFilesMapMutex.Lock()
 	defer ft.brokenFilesMapMutex.Unlock()
+	if ft.brokenFilesMap[filePath] {
+		return false, nil
+	}
 	ft.brokenFilesMap[filePath] = true
+	fmt.Println("broken file:", filePath, fileErr)
+	if ft.brokenFilesList == nil {
+		return true, nil
+	}
 	_, err := ft.brokenFilesList.Write([]byte(fmt.Sprintf("%s\n", filePath)))
-	return errors.Wrap(err)
+	return true, errors.Wrap(err)
 }
 
 func createDirectory(dir string) error {
